@@ -1,2 +1,6 @@
-# buildathon-project5
-The Buildathon is a multi-stage competition that challenges participants to rapidly prototype innovative AI solutions in one day. Contains the code for Project 5
+# Interactive knowledge graph with NL Q&A
+Convert a document archive into an interactive knowledge graph with NL Q&A
+
+* Ingest TXT files, and URLs (≤ 100 MB total)
+* Build a graph of concepts with node/edge visualization
+* Support NL questions over the graph
