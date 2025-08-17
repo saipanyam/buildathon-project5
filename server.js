@@ -27,8 +27,9 @@ app.get('/', (req, res) => {
       '/status': 'GET - Check service status',
       '/connect': 'POST - Test Neo4j connection', 
       '/ingest': 'POST - Ingest documents or URLs',
-      '/query': 'POST - Ask natural language questions',
+      '/query': 'POST - Ask natural language questions (supports mode: auto/global/local)',
       '/stats': 'GET - Get graph statistics',
+      '/communities': 'POST - Detect and analyze communities',
       '/clear': 'POST - Clear graph data'
     },
     documentation: 'https://github.com/saipanyam/buildathon-project5'
@@ -115,7 +116,7 @@ app.post('/ingest', async (req, res) => {
 // Query endpoint
 app.post('/query', async (req, res) => {
   try {
-    const { question } = req.body;
+    const { question, mode } = req.body;
     
     if (!question) {
       return res.status(400).json({
@@ -124,10 +125,16 @@ app.post('/query', async (req, res) => {
       });
     }
 
-    const { stdout } = await execPromise(`node knowledge-graph.js query "${question}"`);
+    let command = `node knowledge-graph.js query "${question}"`;
+    if (mode && ['auto', 'global', 'local'].includes(mode)) {
+      command += ` --mode ${mode}`;
+    }
+
+    const { stdout } = await execPromise(command);
     res.json({ 
       status: 'success', 
       question: question,
+      mode: mode || 'auto',
       answer: stdout,
       timestamp: new Date().toISOString()
     });
@@ -144,6 +151,24 @@ app.post('/query', async (req, res) => {
 app.get('/stats', async (req, res) => {
   try {
     const { stdout } = await execPromise('node knowledge-graph.js stats');
+    res.json({ 
+      status: 'success', 
+      output: stdout,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'error', 
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Communities endpoint
+app.post('/communities', async (req, res) => {
+  try {
+    const { stdout } = await execPromise('node knowledge-graph.js communities');
     res.json({ 
       status: 'success', 
       output: stdout,
