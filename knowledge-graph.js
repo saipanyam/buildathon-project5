@@ -52,8 +52,11 @@ class KnowledgeGraph {
       // Create constraints and indexes
       await session.run('CREATE CONSTRAINT doc_id IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE');
       await session.run('CREATE CONSTRAINT concept_name IF NOT EXISTS FOR (c:Concept) REQUIRE c.name IS UNIQUE');
+      await session.run('CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE');
       await session.run('CREATE INDEX doc_name IF NOT EXISTS FOR (d:Document) ON (d.name)');
       await session.run('CREATE INDEX concept_freq IF NOT EXISTS FOR (c:Concept) ON (c.frequency)');
+      await session.run('CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.type)');
+      await session.run('CREATE INDEX entity_freq IF NOT EXISTS FOR (e:Entity) ON (e.frequency)');
       
       spinner.succeed('Schema initialized successfully');
       return true;
@@ -90,6 +93,41 @@ class KnowledgeGraph {
     return concepts;
   }
 
+  async extractEntitiesWithLLM(text) {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      console.log('⚠️  No Anthropic API key found, using basic extraction');
+      return this.extractConcepts(text);
+    }
+
+    try {
+      const prompt = `Extract entities and their relationships from this text. Return a JSON object with:
+{
+  "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|CONCEPT|TECHNOLOGY|LOCATION", "description": "brief description"}],
+  "relationships": [{"source": "entity1", "target": "entity2", "type": "RELATED_TO|WORKS_AT|PART_OF|USES", "description": "relationship description"}]
+}
+
+Text: ${text.substring(0, 2000)}`;
+
+      const response = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: 'claude-3-haiku-20240307',
+        max_tokens: 2000,
+        messages: [{ role: 'user', content: prompt }]
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01'
+        }
+      });
+
+      const result = JSON.parse(response.data.content[0].text);
+      return result;
+    } catch (error) {
+      console.log('⚠️  LLM extraction failed, falling back to basic extraction:', error.message);
+      return { entities: await this.extractConcepts(text), relationships: [] };
+    }
+  }
+
   async ingestFile(filePath, clear = false) {
     const spinner = ora(`Processing file: ${path.basename(filePath)}`).start();
     
@@ -110,8 +148,9 @@ class KnowledgeGraph {
         spinner.text = 'Cleared existing data, processing file...';
       }
 
-      // Extract concepts
-      const concepts = await this.extractConcepts(content);
+      // Enhanced entity extraction with LLM
+      spinner.text = 'Extracting entities and relationships...';
+      const extracted = await this.extractEntitiesWithLLM(content);
       
       // Create document node
       const docId = path.basename(filePath) + '_' + Date.now();
@@ -120,25 +159,40 @@ class KnowledgeGraph {
         , { id: docId, name: path.basename(filePath), content: content.substring(0, 1000), size: stats.size }
       );
 
-      // Create concept nodes and relationships
-      for (const concept of concepts) {
+      // Create entity nodes and relationships
+      const entities = extracted.entities || extracted;
+      for (const entity of entities) {
+        const entityData = {
+          name: entity.name,
+          type: entity.type || 'CONCEPT',
+          description: entity.description || '',
+          frequency: entity.frequency || 1
+        };
+        
         await session.run(
-          `MERGE (c:Concept {name: $name})
-           ON CREATE SET c.frequency = $frequency, c.createdAt = datetime()
-           ON MATCH SET c.frequency = c.frequency + $frequency`,
-          concept
+          `MERGE (e:Entity {name: $name})
+           ON CREATE SET e.type = $type, e.description = $description, e.frequency = $frequency, e.createdAt = datetime()
+           ON MATCH SET e.frequency = e.frequency + $frequency`,
+          entityData
         );
         
         await session.run(
-          'MATCH (d:Document {id: $docId}), (c:Concept {name: $conceptName}) CREATE (d)-[:CONTAINS {frequency: $frequency}]->(c)',
-          { docId, conceptName: concept.name, frequency: concept.frequency }
+          'MATCH (d:Document {id: $docId}), (e:Entity {name: $entityName}) CREATE (d)-[:CONTAINS {frequency: $frequency}]->(e)',
+          { docId, entityName: entity.name, frequency: entity.frequency || 1 }
         );
       }
 
-      // Create concept relationships based on co-occurrence
-      await this.createConceptRelationships(concepts);
+      // Create entity relationships
+      if (extracted.relationships) {
+        await this.createEntityRelationships(extracted.relationships, docId);
+      }
 
-      spinner.succeed(`Successfully processed: ${path.basename(filePath)} (${concepts.length} concepts extracted)`);
+      // Create concept relationships based on co-occurrence (fallback)
+      if (!extracted.relationships || extracted.relationships.length === 0) {
+        await this.createConceptRelationships(entities);
+      }
+
+      spinner.succeed(`Successfully processed: ${path.basename(filePath)} (${entities.length} entities extracted)`);
       return true;
 
     } catch (error) {
@@ -229,7 +283,143 @@ class KnowledgeGraph {
     }
   }
 
-  async queryGraph(question) {
+  async createEntityRelationships(relationships, docId) {
+    // Create LLM-extracted relationships between entities
+    for (const rel of relationships) {
+      try {
+        await session.run(
+          `MATCH (e1:Entity {name: $source}), (e2:Entity {name: $target})
+           MERGE (e1)-[r:${rel.type || 'RELATED_TO'}]->(e2)
+           ON CREATE SET r.description = $description, r.confidence = 1.0, r.docId = $docId
+           ON MATCH SET r.confidence = r.confidence + 0.1`,
+          { 
+            source: rel.source, 
+            target: rel.target, 
+            description: rel.description || '',
+            docId 
+          }
+        );
+      } catch (error) {
+        // Skip invalid relationships
+        console.log(`⚠️  Skipped relationship: ${rel.source} -> ${rel.target}`);
+      }
+    }
+  }
+
+  async detectCommunities() {
+    // Basic community detection using connected components
+    try {
+      const result = await session.run(`
+        CALL gds.graph.project('entity-graph', 'Entity', '*') YIELD graphName
+        CALL gds.wcc.write('entity-graph', { writeProperty: 'community' })
+        YIELD nodePropertiesWritten, componentCount
+        CALL gds.graph.drop('entity-graph')
+        RETURN componentCount as communities, nodePropertiesWritten as nodes
+      `);
+      
+      return result.records[0]?.get('communities')?.toNumber() || 0;
+    } catch (error) {
+      // Fallback: simple clustering based on entity types
+      await session.run(`
+        MATCH (e:Entity)
+        SET e.community = CASE 
+          WHEN e.type = 'PERSON' THEN 'people'
+          WHEN e.type = 'ORGANIZATION' THEN 'organizations'
+          WHEN e.type = 'TECHNOLOGY' THEN 'technologies'
+          WHEN e.type = 'LOCATION' THEN 'locations'
+          ELSE 'concepts'
+        END
+      `);
+      
+      const result = await session.run('MATCH (e:Entity) RETURN DISTINCT e.community as community');
+      return result.records.length;
+    }
+  }
+
+  async queryGraph(question, mode = 'auto') {
+    try {
+      // Determine search mode automatically if not specified
+      if (mode === 'auto') {
+        mode = this.determineSearchMode(question);
+      }
+
+      if (mode === 'global') {
+        return await this.globalSearch(question);
+      } else {
+        return await this.localSearch(question);
+      }
+    } catch (error) {
+      console.error('Query error:', error);
+      return `Error processing question: ${error.message}`;
+    }
+  }
+
+  determineSearchMode(question) {
+    // Global search for broad, analytical questions
+    const globalIndicators = ['overall', 'general', 'compare', 'analyze', 'overview', 'summary', 'trend', 'pattern'];
+    const localIndicators = ['specific', 'detail', 'who', 'what', 'when', 'where', 'how'];
+    
+    const lowerQuestion = question.toLowerCase();
+    const globalScore = globalIndicators.filter(indicator => lowerQuestion.includes(indicator)).length;
+    const localScore = localIndicators.filter(indicator => lowerQuestion.includes(indicator)).length;
+    
+    return globalScore > localScore ? 'global' : 'local';
+  }
+
+  async globalSearch(question) {
+    // Global search: reasoning about corpus-wide patterns
+    try {
+      // Get community summaries
+      const communitiesQuery = `
+        MATCH (e:Entity)
+        WHERE e.community IS NOT NULL
+        WITH e.community as community, COLLECT(e) as entities
+        RETURN community, SIZE(entities) as size, 
+               [entity IN entities | entity.name][0..5] as sampleEntities
+        ORDER BY size DESC
+        LIMIT 10
+      `;
+      
+      const communitiesResult = await session.run(communitiesQuery);
+      const communities = communitiesResult.records.map(record => ({
+        name: record.get('community'),
+        size: record.get('size').toNumber(),
+        entities: record.get('sampleEntities')
+      }));
+
+      // Use LLM to generate global insights
+      if (process.env.ANTHROPIC_API_KEY && communities.length > 0) {
+        const prompt = `Based on the knowledge graph communities below, answer this question: "${question}"
+
+Communities in the knowledge graph:
+${communities.map(c => `- ${c.name}: ${c.size} entities (examples: ${c.entities.join(', ')})`).join('\n')}
+
+Provide a comprehensive answer based on patterns across the entire dataset.`;
+
+        const response = await axios.post('https://api.anthropic.com/v1/messages', {
+          model: 'claude-3-haiku-20240307',
+          max_tokens: 1000,
+          messages: [{ role: 'user', content: prompt }]
+        }, {
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': process.env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01'
+          }
+        });
+
+        return response.data.content[0].text;
+      }
+
+      return `Global overview: Found ${communities.length} communities in the knowledge graph:\n` +
+             communities.map(c => `• ${c.name}: ${c.size} entities`).join('\n');
+    } catch (error) {
+      return `Global search error: ${error.message}`;
+    }
+  }
+
+  async localSearch(question) {
+    // Local search: exploring specific entity contexts
     try {
       // Extract key terms from question
       const questionTokens = this.tokenizer.tokenize(question.toLowerCase());
@@ -241,66 +431,103 @@ class KnowledgeGraph {
         return 'Please provide a more specific question with meaningful terms.';
       }
 
-      // Find relevant concepts
-      const conceptQuery = `
-        MATCH (c:Concept)
-        WHERE ANY(term IN $terms WHERE c.name CONTAINS term)
-        RETURN c.name as concept, c.frequency as frequency
-        ORDER BY c.frequency DESC
+      // Find relevant entities (enhanced from old concept search)
+      const entityQuery = `
+        MATCH (e:Entity)
+        WHERE ANY(term IN $terms WHERE e.name CONTAINS term OR e.description CONTAINS term)
+        OPTIONAL MATCH (e)-[r]-(connected:Entity)
+        WITH e, COLLECT(DISTINCT connected.name)[0..5] as connectedEntities
+        RETURN e.name as entity, e.type as type, e.description as description, e.frequency as frequency,
+               connectedEntities
+        ORDER BY frequency DESC
         LIMIT 10
       `;
       
-      const conceptResult = await session.run(conceptQuery, { terms: keyTerms });
-      const relevantConcepts = conceptResult.records.map(record => ({
-        name: record.get('concept'),
-        frequency: record.get('frequency')
+      const entityResult = await session.run(entityQuery, { terms: keyTerms });
+      const relevantEntities = entityResult.records.map(record => ({
+        name: record.get('entity'),
+        type: record.get('type'),
+        description: record.get('description'),
+        connected: record.get('connectedEntities')
       }));
 
-      if (relevantConcepts.length === 0) {
-        return 'No relevant concepts found in the knowledge graph for your question.';
+      // Fallback to concepts if no entities found
+      if (relevantEntities.length === 0) {
+        console.log('🔄 No entities found, falling back to concept search...');
+        const conceptQuery = `
+          MATCH (c:Concept)
+          WHERE ANY(term IN $terms WHERE c.name CONTAINS term)
+          RETURN c.name as concept, c.frequency as frequency
+          ORDER BY c.frequency DESC
+          LIMIT 10
+        `;
+        
+        const conceptResult = await session.run(conceptQuery, { terms: keyTerms });
+        const relevantConcepts = conceptResult.records.map(record => ({
+          name: record.get('concept'),
+          type: 'CONCEPT',
+          description: '',
+          connected: [],
+          frequency: record.get('frequency')
+        }));
+        
+        if (relevantConcepts.length === 0) {
+          return 'No relevant concepts or entities found in the knowledge graph for your question.';
+        }
+        
+        // Use concepts as entities for the rest of the process
+        for (const concept of relevantConcepts) {
+          relevantEntities.push(concept);
+        }
       }
 
-      // Find documents containing these concepts
+      // Find documents containing these entities/concepts
       const docQuery = `
-        MATCH (d:Document)-[r:CONTAINS]->(c:Concept)
-        WHERE c.name IN $concepts
+        MATCH (d:Document)-[r:CONTAINS]->(n)
+        WHERE (n:Entity OR n:Concept) AND n.name IN $entities
         RETURN d.name as document, d.content as content, d.type as type, 
-               COLLECT(c.name) as concepts, SUM(r.frequency) as relevance
+               COLLECT(n.name) as entities, SUM(r.frequency) as relevance
         ORDER BY relevance DESC
         LIMIT 5
       `;
       
       const docResult = await session.run(docQuery, { 
-        concepts: relevantConcepts.map(c => c.name) 
+        entities: relevantEntities.map(e => e.name) 
       });
       
-      const relevantDocs = docResult.records.map(record => ({
-        name: record.get('document'),
-        content: record.get('content'),
-        type: record.get('type'),
-        concepts: record.get('concepts'),
-        relevance: record.get('relevance')
-      }));
+      const relevantDocs = docResult.records.map(record => {
+        const relevanceValue = record.get('relevance');
+        return {
+          name: record.get('document'),
+          content: record.get('content'),
+          type: record.get('type'),
+          entities: record.get('entities'),
+          relevance: neo4j.isInt(relevanceValue) ? relevanceValue.toNumber() : (relevanceValue || 0)
+        };
+      });
 
       // Build response
       let response = `Based on your question about "${question}", here's what I found:\n\n`;
       
-      response += `🔍 **Relevant Concepts:**\n`;
-      relevantConcepts.slice(0, 5).forEach(concept => {
-        response += `   • ${concept.name} (frequency: ${concept.frequency})\n`;
+      response += `🔍 **Relevant Entities:**\n`;
+      relevantEntities.slice(0, 5).forEach(entity => {
+        response += `   • ${entity.name} (${entity.type})${entity.description ? ': ' + entity.description : ''}\n`;
+        if (entity.connected && entity.connected.length > 0) {
+          response += `     Connected to: ${entity.connected.slice(0, 3).join(', ')}\n`;
+        }
       });
       
       response += `\n📄 **Related Documents:**\n`;
       relevantDocs.forEach((doc, index) => {
         response += `   ${index + 1}. ${doc.name} (${doc.type})\n`;
         response += `      Preview: ${doc.content.substring(0, 200)}...\n`;
-        response += `      Key concepts: ${doc.concepts.slice(0, 3).join(', ')}\n\n`;
+        response += `      Key entities: ${doc.entities.slice(0, 3).join(', ')}\n\n`;
       });
 
       return response;
 
     } catch (error) {
-      return `Error querying knowledge graph: ${error.message}`;
+      return `Local search error: ${error.message}`;
     }
   }
 
@@ -312,20 +539,36 @@ class KnowledgeGraph {
       const docResult = await session.run('MATCH (d:Document) RETURN COUNT(d) as count');
       stats.documents = docResult.records[0].get('count').toNumber();
       
-      // Count concepts
+      // Count concepts (legacy)
       const conceptResult = await session.run('MATCH (c:Concept) RETURN COUNT(c) as count');
       stats.concepts = conceptResult.records[0].get('count').toNumber();
       
+      // Count entities (enhanced)
+      const entityResult = await session.run('MATCH (e:Entity) RETURN COUNT(e) as count');
+      stats.entities = entityResult.records[0].get('count').toNumber();
+      
       // Count relationships
-      const relResult = await session.run('MATCH ()-[r:RELATED_TO]-() RETURN COUNT(r) as count');
+      const relResult = await session.run('MATCH ()-[r]-() RETURN COUNT(r) as count');
       stats.relationships = relResult.records[0].get('count').toNumber();
       
-      // Top concepts
-      const topResult = await session.run(
-        'MATCH (c:Concept) RETURN c.name as name, c.frequency as frequency ORDER BY c.frequency DESC LIMIT 10'
+      // Count communities
+      const communityResult = await session.run('MATCH (e:Entity) WHERE e.community IS NOT NULL RETURN COUNT(DISTINCT e.community) as count');
+      stats.communities = communityResult.records[0]?.get('count')?.toNumber() || 0;
+      
+      // Top entities by type
+      const typeResult = await session.run('MATCH (e:Entity) RETURN e.type as type, COUNT(e) as count ORDER BY count DESC');
+      stats.entityTypes = typeResult.records.map(record => ({
+        type: record.get('type'),
+        count: record.get('count').toNumber()
+      }));
+      
+      // Top entities
+      const topEntityResult = await session.run(
+        'MATCH (e:Entity) RETURN e.name as name, e.type as type, e.frequency as frequency ORDER BY e.frequency DESC LIMIT 10'
       );
-      stats.topConcepts = topResult.records.map(record => ({
+      stats.topEntities = topEntityResult.records.map(record => ({
         name: record.get('name'),
+        type: record.get('type'),
         frequency: record.get('frequency')
       }));
       
@@ -447,8 +690,9 @@ program
 // Query command - Ask natural language questions
 program
   .command('query <question>')
-  .description('Ask a natural language question about the knowledge graph')
-  .action(async (question) => {
+  .description('🤔 Ask a natural language question about the knowledge graph')
+  .option('-m, --mode <mode>', 'Search mode: auto, global, local', 'auto')
+  .action(async (question, options) => {
     const connected = await kg.connect(
       process.env.NEO4J_URL || 'bolt://localhost:7687',
       process.env.NEO4J_USER || 'neo4j',
@@ -461,9 +705,11 @@ program
       process.exit(1);
     }
 
-    console.log(chalk.blue(`🤔 Processing question: "${question}"\n`));
+    const mode = options.mode;
+    console.log(chalk.blue(`🤔 Processing question: "${question}"`));
+    console.log(chalk.gray(`🔍 Search mode: ${mode}\n`));
     
-    const answer = await kg.queryGraph(question);
+    const answer = await kg.queryGraph(question, mode);
     console.log(answer);
     
     await kg.close();
@@ -536,11 +782,22 @@ program
       console.log(chalk.green(`🧠 Concepts: ${stats.concepts}`));
       console.log(chalk.green(`🔗 Relationships: ${stats.relationships}`));
       
-      if (stats.topConcepts.length > 0) {
-        console.log(chalk.blue('\n🔥 Top Concepts:'));
-        stats.topConcepts.forEach((concept, index) => {
-          console.log(chalk.cyan(`   ${index + 1}. ${concept.name} (frequency: ${concept.frequency})`));
+      if (stats.topEntities && stats.topEntities.length > 0) {
+        console.log(chalk.blue('\n🔥 Top Entities:'));
+        stats.topEntities.forEach((entity, index) => {
+          console.log(chalk.cyan(`   ${index + 1}. ${entity.name} (${entity.type}) - frequency: ${entity.frequency}`));
         });
+      }
+      
+      if (stats.entityTypes && stats.entityTypes.length > 0) {
+        console.log(chalk.blue('\n📊 Entity Types:'));
+        stats.entityTypes.forEach(type => {
+          console.log(chalk.cyan(`   • ${type.type}: ${type.count} entities`));
+        });
+      }
+      
+      if (stats.communities > 0) {
+        console.log(chalk.blue(`\n🏘️  Communities: ${stats.communities}`));
       }
       
       console.log(chalk.yellow('\n💡 Tip: Visit https://browser.neo4j.io/ to visualize your graph'));
@@ -665,6 +922,76 @@ program
     } catch (error) {
       spinner.fail('Failed to clear knowledge graph');
       console.error(chalk.red('Error:'), error.message);
+    }
+    
+    await kg.close();
+  });
+
+// Communities command - Detect and analyze communities
+program
+  .command('communities')
+  .description('🏘️  Detect communities in the knowledge graph')
+  .action(async () => {
+    console.log(chalk.blue('🏘️  Knowledge Graph Communities\n'));
+    
+    const kg = new KnowledgeGraph();
+    
+    const connected = await kg.connect(
+      process.env.NEO4J_URL || 'bolt://localhost:7687',
+      process.env.NEO4J_USER || 'neo4j',
+      process.env.NEO4J_PASSWORD || 'password',
+      process.env.NEO4J_DATABASE || 'neo4j'
+    );
+
+    if (!connected) {
+      console.error(chalk.red('❌ Failed to connect to Neo4j'));
+      process.exit(1);
+    }
+
+    try {
+      const communityCount = await kg.detectCommunities();
+      console.log(chalk.green(`✅ Detected ${communityCount} communities`));
+      
+      // Show community details
+      const communitiesQuery = `
+        MATCH (e:Entity)
+        WHERE e.community IS NOT NULL
+        WITH e.community as community, COLLECT(e.name) as entities, COLLECT(e.type) as types
+        RETURN community, SIZE(entities) as size, entities[0..5] as sampleEntities, 
+               apoc.coll.frequencies(types) as typeDistribution
+        ORDER BY size DESC
+      `;
+      
+      try {
+        const result = await session.run(communitiesQuery);
+        result.records.forEach((record, index) => {
+          const community = record.get('community');
+          const size = record.get('size').toNumber();
+          const samples = record.get('sampleEntities');
+          console.log(chalk.cyan(`\n${index + 1}. Community: ${community} (${size} entities)`));
+          console.log(chalk.white(`   Sample entities: ${samples.join(', ')}`));
+        });
+      } catch (error) {
+        // Fallback for systems without APOC
+        const simpleQuery = `
+          MATCH (e:Entity)
+          WHERE e.community IS NOT NULL
+          WITH e.community as community, COLLECT(e.name) as entities
+          RETURN community, SIZE(entities) as size, entities[0..5] as sampleEntities
+          ORDER BY size DESC
+        `;
+        const result = await session.run(simpleQuery);
+        result.records.forEach((record, index) => {
+          const community = record.get('community');
+          const size = record.get('size').toNumber();
+          const samples = record.get('sampleEntities');
+          console.log(chalk.cyan(`\n${index + 1}. Community: ${community} (${size} entities)`));
+          console.log(chalk.white(`   Sample entities: ${samples.join(', ')}`));
+        });
+      }
+      
+    } catch (error) {
+      console.error(chalk.red('❌ Failed to detect communities:'), error.message);
     }
     
     await kg.close();
