@@ -2,9 +2,15 @@
   "name": "buildathon-project5",
   "version": "1.0.0",
   "description": "Convert a document archive into an interactive knowledge graph with natural language Q&A support.",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "cli": "node knowledge-graph.js",
     "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "repository": {
     "type": "git",
@@ -23,7 +29,9 @@
     "chalk": "^4.1.2",
     "cheerio": "^1.1.2",
     "commander": "^14.0.0",
+    "cors": "^2.8.5",
     "dotenv": "^17.2.1",
+    "express": "^5.1.0",
     "fs-extra": "^11.3.1",
     "natural": "^8.1.0",
     "neo4j-driver": "^5.28.1",

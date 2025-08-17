@@ -72,6 +72,7 @@ docs/_build/
 .env
 .envrc
 .venv
+.myenv
 env/
 venv/
 ENV/
@@ -137,10 +138,12 @@ logs/**/*.log
 notes_ignore/
 *.notes.txt
 *.notes.sh
-
+*.notes.pdf
 
 # ---------------------------
 # Custom
+.myenv
+.env
 # ---------------------------
 # Ignore Python virtualenvs & caches
 __pypackages__/
